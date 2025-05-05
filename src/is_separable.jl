@@ -8,9 +8,8 @@ using JuMP
 import LinearAlgebra
 import SCS
 import Hypatia
-	
 
-k, d = 3, 2
+k, d = 3, 4
 ρ = Ket.random_state(d, k)
 X = ρ
 
@@ -20,24 +19,72 @@ function is_ppt(ρ::AbstractMatrix, dims::Vector{Int}, sys::Int=2; atol=1e-10)
     return all(λs .>= -atol)
 end
 
+function realignment(X::AbstractArray, dim=nothing)
+    dX = size(X)
+    inferred_dim = round.(sqrt.(dX))
+
+    if dim === nothing
+        dim = collect(inferred_dim)
+    end
+
+    if length(dim) == 1
+        dim = [dim, dX[1] / dim]
+        if abs(dim[2] - round(dim[2])) >= 2 * dX[1] * eps()
+            error("Realignment:InvalidDim — ",
+                "If `dim` is a scalar, `X` must be square and `dim` must evenly divide length(X); ",
+                "please provide a two-element `dim` array specifying the subsystem dimensions.")
+        end
+        dim[2] = round(dim[2])
+    end
+
+    if minimum(size(dim)) == 1
+        dim = vec(dim)'
+        dim = vcat(dim, dim)
+    end
+
+    dA, dB = Int.(vec(dim))
+
+    X_tensor = reshape(X, dA, dB, dA, dB)
+    X_swapped = permutedims(X_tensor, (2, 1, 4, 3))
+    X_swapped_matrix = reshape(X_swapped, dA * dB, dA * dB)
+
+    X_pt = Ket.partial_transpose(X_swapped_matrix, [1], [dB, dA])
+    X_pt_tensor = reshape(X_pt, dB, dA, dB, dA)
+    X_unswapped = permutedims(X_pt_tensor, (2, 1, 4, 3))
+
+    return reshape(X_unswapped, dA^2, dB^2)
+end
+
+
+function swap_subsystems(X::Matrix{<:Number}, sys::Tuple{Int,Int}, dim::AbstractVector{<:Int})
+    d1, d2 = Int.(vec(dim))
+    total_dim = d1 * d2
+    @assert size(X, 1) == total_dim && size(X, 2) == total_dim "Matrix size doesn't match subsystem dimensions"
+
+    X_tensor = reshape(X, d1, d2, d1, d2)
+    X_swapped = permutedims(X_tensor, (2, 1, 4, 3))
+    return reshape(X_swapped, total_dim, total_dim)
+end
+
+
 function isseparable(X; args...)
     X = Matrix(X)
-    if ! LinearAlgebra.isposdef(X)
+    if !LinearAlgebra.isposdef(X)
         error("X is not positive semidefinite, so the idea of it being separable does not make sense.")
     end
 
-    lX = LinearAlgebra.length(X)
+    lX = maximum(size(X))
     rX = LinearAlgebra.rank(X)
     X = X / LinearAlgebra.tr(X)
     sep = -1
 
-    default_args = (round(sqrt(lX)), 2, 1, eps() ^ (3/8))
+    default_args = (round(sqrt(lX)), 2, 1, eps()^(3 / 8))
     dim, str, verbose, tol = ntuple(i -> i <= length(args) ? args[i] : default_args[i], length(default_args))
 
     if length(dim) == 1
         dim = [dim, lX / dim]
         if abs(dim[2] - round(dim[2])) >= 2 * lX * eps()
-            error("IsSeparable:InvalidDim','If DIM is a scalar, it must evenly divide length(X); please provide the DIM array containing the dimensions of the subsystems.");
+            error("IsSeparable:InvalidDim','If DIM is a scalar, it must evenly divide length(X); please provide the DIM array containing the dimensions of the subsystems.")
         end
         dim[2] = round(dim[2])
     end
@@ -51,7 +98,7 @@ function isseparable(X; args...)
         if Bool(verbose)
             println("Every positive semidefinite matrix is separable when one of the local dimensions is 1.")
         end
-        return
+        return sep
     end
 
     XA = Ket.partial_trace(X, [2], Int.(dim))
@@ -78,7 +125,7 @@ function isseparable(X; args...)
         "L. Chen and D. Z. Djokovic. Separability problem for multipartite states of rank at most four. J. Phys. A: Math. Theor., 46:275304, 2013.",
         "G. Vidal and R. Tarrach. Robustness of entanglement. Phys. Rev. A, 59:141–155, 1999."
     ]
-
+    
     ppt = is_ppt(X, Int.(dim))
 
     if !ppt
@@ -86,26 +133,93 @@ function isseparable(X; args...)
         if Bool(verbose)
             println("Determined to be entangled via the PPT criterion. Reference:\n", refs[1], "\n")
         end
-        return
+        return sep
     
     elseif pD <= 6 || minimum(dim) <= 1
         sep = 1
         if Bool(verbose)
             println("Determined to be separable via sufficiency of the PPT criterion in small dimensions. Reference:\n", refs[2], "\n")
         end
-        return
-    
+        return sep
+
     elseif rX <= 3 || rX <= LinearAlgebra.rank(XB) || rX <= LinearAlgebra.rank(XA)
         sep = 1
         if Bool(verbose)
-            ("Determined to be separable via sufficiency of the PPT criterion for low-rank operators. Reference:\n", refs[3], "\n")
+            println("Determined to be separable via sufficiency of the PPT criterion for low-rank operators. Reference:\n", refs[3], "\n")
         end
-        return
+        return sep
     end
+
+    if Bool(verbose) && Ket.trace_norm(realignment(X, dim)) > 1
+        sep = 0
+        println("Determined to be entangled via the realignment criterion. Reference:\n$(refs[4])\n")
+        return sep
+    end
+
+    if Ket.trace_norm(realignment(X - kron(XA, XB))) > sqrt(real((1 - LinearAlgebra.tr(XA^2)) * (1 - LinearAlgebra.tr(XB^2))))
+        sep = 0
+        if Bool(verbose)
+            println("Determined to be entangled by using Theorem 1 of reference:\n", refs[14], "\n")
+        end
+        return sep
+    end
+
+    lam = sort(real.(LinearAlgebra.eigen(X).values), rev=true)
+
+    if nD == 2
+        if ((lam[1] - lam[Int(2 * xD - 1)])^2) <= (4 * lam[Int(2 * xD - 2)] * lam[Int(2 * xD)] + tol^2)
+            sep = 1
+            if Bool(verbose)
+                println("Determined to be separable by inspecting its eigenvalues. Reference:\n", refs[13], "\n")
+            end
+            return sep
+        end
+        if dim[1] > 2
+            Xt = swap_subsystems(X, (1, 2), dim)
+        else
+            Xt = X
+        end
+    
+        A = Xt[1:Int(xD), 1:Int(xD)]
+        B = Xt[1:Int(xD), Int(xD)+1:2*Int(xD)]
+        C = Xt[Int(xD)+1:2*Int(xD), Int(xD)+1:2*Int(xD)]
+    
+        if Bool(verbose) && (LinearAlgebra.norm(B - B') < tol ^ 2)
+            sep = 1
+            println("Determined to be separable by being a block Hankel matrix:\n", refs[15], "\n")
+            return sep
+        end
+    
+        if (LinearAlgebra.rank(B - B') <= 1) && ppt
+            sep = 1
+            if Bool(verbose)
+                println("Determined to be separable by being a perturbed block Hankel matrix:\n", refs[16], "\n")
+            end
+            return sep
+        end
+    
+        X_2n_ppt_check = vcat(
+            hcat((5/6) * A - C / 6, B),
+            hcat(B', (5/6) * C - A / 6)
+        )
+    
+        if LinearAlgebra.isposdef(X_2n_ppt_check) && is_ppt(X_2n_ppt_check, [2, Int(xD)])
+            sep = 1
+            if Bool(verbose)
+                println("Determined to be separable via the homothetic images approach of:\n", refs[16], "\n")
+            end
+            return sep
+        end
+    end
+
+    println("No separability criterion was satisfied. The state is likely entangled.")
 end
 
 
-main() = isseparable(X)
+main() = begin
+    println("Testing is_separable.jl")
+    isseparable(X, dim=[4,4], verbose=1)
+end
 
 export main
 end # module is_separable
